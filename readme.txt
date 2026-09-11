@@ -4,7 +4,6 @@ Tags: analytics, user journey, excel, tracking
 Requires at least: 6.0
 Requires PHP: 7.4
 Stable tag: 1.2.0
-License: GPLv2 or later
 
 ثبت مسیر صفحات بازدیدشده کاربران و خروجی XLSX با یک ردیف برای هر کاربر.
 
