@@ -2,18 +2,20 @@
 /**
  * Plugin Name: User Journey
  * Description: ثبت مسیر بازدید کاربران و خروجی Excel؛ هر کاربر در یک ردیف و هر بازدید در یک ستون.
- * Version: 1.2.0
+ * Version: 1.2.2
  * Author: Delaram
  * Author URI: https://github.com/Delaram
- * Requires at least: 6.0
+ * Requires at least: 6.2
  * Requires PHP: 7.4
- * Text Domain: user-journey
+ * License: GPL-2.0-or-later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain: user-journey-main
  */
 
 if (!defined('ABSPATH')) { exit; }
 
 final class User_Journey {
-    const VERSION = '1.2.0';
+    const VERSION = '1.2.2';
     const DB_VERSION = '1.2';
     const VISITOR_COOKIE = 'uj_visitor_id';
     const JOURNEY_COOKIE = 'uj_journey';
@@ -110,7 +112,9 @@ final class User_Journey {
     public function record_visit(WP_REST_Request $request) {
         global $wpdb;
 
-        $user_agent = isset($_SERVER['HTTP_USER_AGENT']) ? (string) $_SERVER['HTTP_USER_AGENT'] : '';
+        $user_agent = isset($_SERVER['HTTP_USER_AGENT'])
+            ? sanitize_text_field(wp_unslash($_SERVER['HTTP_USER_AGENT']))
+            : '';
         if (preg_match('/bot|crawler|spider|slurp|bingpreview|facebookexternalhit|headless/i', $user_agent)) {
             return rest_ensure_response(array('success' => true, 'ignored' => 'bot'));
         }
@@ -133,12 +137,12 @@ final class User_Journey {
         }
         $visits = array_slice($visits, 0, self::MAX_BATCH_SIZE);
         $site_host = wp_parse_url(home_url(), PHP_URL_HOST);
-        $placeholders = array();
-        $values = array();
+        $records = array();
 
         foreach ($visits as $visit) {
             if (!is_array($visit)) { continue; }
             $url = esc_url_raw(isset($visit['url']) ? $visit['url'] : '');
+            $url = substr($url, 0, 4096);
             $url_host = wp_parse_url($url, PHP_URL_HOST);
             if (!$url || !$url_host || strtolower($site_host) !== strtolower($url_host)) { continue; }
 
@@ -152,25 +156,55 @@ final class User_Journey {
 
             $browser = substr(sanitize_text_field(isset($visit['browser']) ? $visit['browser'] : ''), 0, 80);
             $device = substr(sanitize_text_field(isset($visit['device']) ? $visit['device'] : ''), 0, 40);
-            $referrer = empty($visit['referrer']) ? '' : esc_url_raw($visit['referrer']);
+            $referrer = empty($visit['referrer']) ? '' : substr(esc_url_raw($visit['referrer']), 0, 4096);
             $five_second_bucket = (string) floor((float) $utc_date->format('U.u') / 5);
             $event_key = md5($url . '|' . $five_second_bucket);
 
-            $placeholders[] = '(%s, 0, %s, %s, %s, %s, %s, %s, %s)';
-            array_push($values, $visitor_id, $event_key, $url, $referrer, $visited_at, $browser, $device, current_time('mysql', true));
+            $records[] = array(
+                $visitor_id,
+                $event_key,
+                $url,
+                $referrer,
+                $visited_at,
+                $browser,
+                $device,
+                current_time('mysql', true),
+            );
         }
 
-        if (!$placeholders) {
+        if (!$records) {
             return new WP_Error('invalid_visits', 'هیچ بازدید معتبری دریافت نشد.', array('status' => 400));
         }
 
-        $sql = "INSERT IGNORE INTO " . self::table_name() . "
-            (visitor_id, visit_order, event_key, url, referrer, visited_at, browser, device, created_at)
-            VALUES " . implode(', ', $placeholders);
-        $inserted = $wpdb->query($wpdb->prepare($sql, $values));
+        $inserted = 0;
+        foreach ($records as $record) {
+            // A direct write is required because visits are stored in the plugin's custom table.
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+            $result = $wpdb->query(
+                $wpdb->prepare(
+                    'INSERT IGNORE INTO %i
+                    (visitor_id, visit_order, event_key, url, referrer, visited_at, browser, device, created_at)
+                    VALUES (%s, 0, %s, %s, %s, %s, %s, %s, %s)',
+                    self::table_name(),
+                    $record[0],
+                    $record[1],
+                    $record[2],
+                    $record[3],
+                    $record[4],
+                    $record[5],
+                    $record[6],
+                    $record[7]
+                )
+            );
+            if (false === $result) {
+                return new WP_Error('db_error', 'ذخیره بازدید انجام نشد.', array('status' => 500));
+            }
+            $inserted += (int) $result;
+        }
 
-        if (false === $inserted) {
-            return new WP_Error('db_error', 'ذخیره بازدید انجام نشد.', array('status' => 500));
+        if ($inserted > 0) {
+            wp_cache_delete('dashboard_stats', 'user_journey');
+            wp_cache_delete('export_rows', 'user_journey');
         }
         return rest_ensure_response(array('success' => true, 'accepted' => (int) $inserted));
     }
@@ -185,15 +219,26 @@ final class User_Journey {
     public function admin_page() {
         if (!current_user_can('manage_options')) { return; }
         global $wpdb;
-        $table = self::table_name();
-        $users = (int) $wpdb->get_var("SELECT COUNT(DISTINCT visitor_id) FROM {$table}");
-        $visits = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$table}");
-        $last = $wpdb->get_var("SELECT MAX(visited_at) FROM {$table}");
-        $recent = $wpdb->get_results("SELECT visitor_id, COUNT(*) visits, MIN(visited_at) first_visit, MAX(visited_at) last_visit FROM {$table} GROUP BY visitor_id ORDER BY last_visit DESC LIMIT 50");
+        $stats = wp_cache_get('dashboard_stats', 'user_journey');
+        if (false === $stats) {
+            // Direct reads are required because this information lives in the plugin's custom table.
+            // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+            $users = (int) $wpdb->get_var($wpdb->prepare('SELECT COUNT(DISTINCT visitor_id) FROM %i', self::table_name()));
+            $visits = (int) $wpdb->get_var($wpdb->prepare('SELECT COUNT(*) FROM %i', self::table_name()));
+            $last = $wpdb->get_var($wpdb->prepare('SELECT MAX(visited_at) FROM %i', self::table_name()));
+            $recent = $wpdb->get_results($wpdb->prepare('SELECT visitor_id, COUNT(*) visits, MIN(visited_at) first_visit, MAX(visited_at) last_visit FROM %i GROUP BY visitor_id ORDER BY last_visit DESC LIMIT %d', self::table_name(), 50));
+            // phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+            $stats = array('users' => $users, 'visits' => $visits, 'last' => $last, 'recent' => $recent);
+            wp_cache_set('dashboard_stats', $stats, 'user_journey', MINUTE_IN_SECONDS);
+        }
+        $users = $stats['users'];
+        $visits = $stats['visits'];
+        $last = $stats['last'];
+        $recent = $stats['recent'];
         ?>
         <div class="wrap" dir="rtl">
             <h1>مسیر بازدید کاربران</h1>
-            <?php if (isset($_GET['uj_deleted'])): ?><div class="notice notice-success"><p>داده‌های مسیر کاربران حذف شد.</p></div><?php endif; ?>
+            <?php if (get_transient('uj_deleted_' . get_current_user_id())): delete_transient('uj_deleted_' . get_current_user_id()); ?><div class="notice notice-success"><p>داده‌های مسیر کاربران حذف شد.</p></div><?php endif; ?>
             <p><strong>تعداد کاربران:</strong> <?php echo esc_html(number_format_i18n($users)); ?> &nbsp; | &nbsp;
                <strong>تعداد بازدیدها:</strong> <?php echo esc_html(number_format_i18n($visits)); ?> &nbsp; | &nbsp;
                <strong>آخرین ثبت:</strong> <?php echo esc_html($last ?: '—'); ?> (UTC)</p>
@@ -227,7 +272,10 @@ final class User_Journey {
         if (!class_exists('ZipArchive')) { wp_die('افزونه ZipArchive روی PHP فعال نیست.'); }
 
         global $wpdb;
-        $rows = $wpdb->get_results("SELECT visitor_id, url, referrer, visited_at, browser, device FROM " . self::table_name() . " ORDER BY visitor_id ASC, visited_at ASC, id ASC", ARRAY_A);
+        // Direct reads are required because export data lives in the plugin's custom table.
+        // The export must always contain current data, so deliberately do not cache it.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+        $rows = $wpdb->get_results($wpdb->prepare('SELECT visitor_id, url, referrer, visited_at, browser, device FROM %i ORDER BY visitor_id ASC, visited_at ASC, id ASC', self::table_name()), ARRAY_A);
         $grouped = array();
         $max_visits = 0;
         foreach ($rows as $row) {
@@ -254,14 +302,30 @@ final class User_Journey {
         }
 
         $tmp = wp_tempnam('user-journey.xlsx');
+        if (!$tmp) {
+            wp_die('ساخت فایل موقت Excel ممکن نشد.');
+        }
         $this->build_xlsx($tmp, $matrix);
         $filename = 'user-journey-' . gmdate('Y-m-d-His') . '.xlsx';
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        if (!WP_Filesystem()) {
+            wp_delete_file($tmp);
+            wp_die('دسترسی به فایل موقت Excel ممکن نشد.');
+        }
+        global $wp_filesystem;
+        $contents = $wp_filesystem->get_contents($tmp);
+        if (false === $contents) {
+            wp_delete_file($tmp);
+            wp_die('خواندن فایل Excel ممکن نشد.');
+        }
         nocache_headers();
         header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
         header('Content-Disposition: attachment; filename="' . $filename . '"');
-        header('Content-Length: ' . filesize($tmp));
-        readfile($tmp);
-        unlink($tmp);
+        header('Content-Length: ' . strlen($contents));
+        // Binary XLSX output cannot be escaped without corrupting the file.
+        // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+        echo $contents;
+        wp_delete_file($tmp);
         exit;
     }
 
@@ -302,15 +366,26 @@ final class User_Journey {
         if (!current_user_can('manage_options')) { wp_die('دسترسی غیرمجاز.'); }
         check_admin_referer('uj_delete_data');
         global $wpdb;
-        $wpdb->query('TRUNCATE TABLE ' . self::table_name());
-        wp_safe_redirect(admin_url('admin.php?page=user-journey&uj_deleted=1'));
+        // A direct write is required because data is stored in the plugin's custom table.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+        $wpdb->query($wpdb->prepare('TRUNCATE TABLE %i', self::table_name()));
+        wp_cache_delete('dashboard_stats', 'user_journey');
+        wp_cache_delete('export_rows', 'user_journey');
+        set_transient('uj_deleted_' . get_current_user_id(), 1, 30);
+        wp_safe_redirect(admin_url('admin.php?page=user-journey'));
         exit;
     }
 
     public function cleanup_old_data() {
         global $wpdb;
         $days = max(30, (int) apply_filters('uj_retention_days', 365));
-        $wpdb->query($wpdb->prepare("DELETE FROM " . self::table_name() . " WHERE visited_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL %d DAY)", $days));
+        // A direct write is required because data is stored in the plugin's custom table.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+        $deleted = $wpdb->query($wpdb->prepare('DELETE FROM %i WHERE visited_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL %d DAY)', self::table_name(), $days));
+        if (false !== $deleted && $deleted > 0) {
+            wp_cache_delete('dashboard_stats', 'user_journey');
+            wp_cache_delete('export_rows', 'user_journey');
+        }
     }
 }
 
